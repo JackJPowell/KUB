@@ -120,8 +120,10 @@ class KUB:
                 self.usage[utility][date] = {}
 
         print(utility, ":", total, usage_data['uom'])
+        return self.usage
 
     def retrieve_all_usage(self):
         self.retrieve_usage(KUB.electricity)
         self.retrieve_usage(KUB.gas)
         self.retrieve_usage(KUB.water)
+        return self.usage
