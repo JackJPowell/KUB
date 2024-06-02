@@ -66,8 +66,12 @@ class kubUtility:
         self.person_id = ""
         self.account_id = ""
         self.account = {}
-        self.usage = {}
-        self.monthly_total = {}
+        self.usage = {"electricity": {}, "gas": {}, "water": {}}
+        self.monthly_total = {
+            "electricity": {"usage": "", "cost": ""},
+            "gas": {"usage": "", "cost": ""},
+            "water": {"usage": "", "cost": ""},
+        }
         self.http = any
 
     async def retrieve_access_token(self):
@@ -215,7 +219,7 @@ class kubUtility:
 
     async def retrieve_monthly_summary(self):
         """Retrieve summary of usage for the current month"""
-        if self.usage == {}:
+        if self.usage is None:
             async with Http() as self.http:
                 await self.retrieve_usage(KUBUtilityTypes.ELECTRICITY)
                 await self.retrieve_usage(KUBUtilityTypes.GAS)
