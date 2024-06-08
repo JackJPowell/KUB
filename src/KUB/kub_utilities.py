@@ -57,7 +57,7 @@ class Http:
         return resp
 
 
-class kubUtility:
+class KubUtility:
     """KUB utilities api"""
 
     def __init__(self, username, password):
@@ -81,6 +81,7 @@ class kubUtility:
 
     @property
     def is_session_active(self):
+        """Getter that returns if session was created within 15m"""
         if datetime.now() < datetime.now() - timedelta(minutes=15):
             return True
         return False
@@ -140,11 +141,13 @@ class kubUtility:
         return self.services
 
     async def retrieve_account_info(self):
+        """Retrieves account info from KUB api"""
         async with Http() as self.http:
             await self._retrieve_access_token()
             await self._retrieve_account_info()
 
     async def retrieve_access_token(self):
+        """Fetches access token"""
         async with Http() as self.http:
             await self._retrieve_access_token()
 
@@ -157,17 +160,17 @@ class kubUtility:
         utility = utility_type.name.lower()
         account = self.account[utility]
 
-        #If we are processing wastewater so just copy water
-        #This does not account for separate meters for water and wastewater
-        #However, I do not know what the response looks like to process
-        #this case properly
+        # If we are processing wastewater so just copy water
+        # This does not account for separate meters for water and wastewater
+        # However, I do not know what the response looks like to process
+        # this case properly
         if utility_type == KUBUtilityTypes.WASTEWATER:
             water = KUBUtilityTypes.WATER.name.lower()
             self.usage[utility] = copy.deepcopy(self.usage[water])
             self.monthly_total[utility]["usage"] = self.monthly_total[water]["usage"]
             self.monthly_total[utility]["cost"] = self.monthly_total[water]["cost"]
             return self.usage
-        
+
         url = (
             "https://www.kub.org/api/ami/v1/usage-values"
             + "?endDate="
@@ -325,4 +328,3 @@ class kubUtility:
         """Verify username and password is able to retreive api token"""
         async with Http() as self.http:
             await self._retrieve_access_token()
-        
