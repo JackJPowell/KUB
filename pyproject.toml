@@ -1,6 +1,6 @@
 [project]
 name = "kub"
-version = "0.6.0"
+version = "0.6.1"
 description = "A python library to interface with the KUB api"
 authors = [{name = "Jack Powell", email = "jackattack51@gmail.com"}]
 license = {text = "MIT"}

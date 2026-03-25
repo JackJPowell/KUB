@@ -19,11 +19,15 @@ _TENANT_HOST = "https://login.kub.org"
 _TENANT_PATH = "/login.kub.org/B2C_1_sign_in"
 _POLICY = "B2C_1_sign_in"
 _REDIRECT_URI = "https://www.kub.org/auth-callback"
-_SCOPE = f"openid profile {_CLIENT_ID}"
+_SCOPE = "openid"
 _AUTHORIZE_URL = f"{_TENANT_HOST}{_TENANT_PATH}/oauth2/v2.0/authorize"
 _TOKEN_URL = f"{_TENANT_HOST}{_TENANT_PATH}/oauth2/v2.0/token"
 _SELF_ASSERTED_URL = f"{_TENANT_HOST}{_TENANT_PATH}/SelfAsserted"
 _CONFIRMED_URL = f"{_TENANT_HOST}{_TENANT_PATH}/api/CombinedSigninAndSignup/confirmed"
+# KUB's server-side token proxy — what the browser uses instead of calling B2C directly.
+# This proxy exchanges the auth code with B2C, then returns the id_token via Set-Cookie.
+_KUB_TOKEN_PROXY = "https://www.kub.org/api/auth/v1/oauth2/v2.0/token/customer"
+_KUB_BASE = "https://www.kub.org"
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -58,18 +62,38 @@ class KUBUtilityTypes(Enum):
 
 
 class Http:
-    """Simple http class to wrap api calls"""
+    """Simple http class to wrap api calls.
 
-    def __init__(self, access_token: str = "") -> None:
+    Supports two auth modes:
+    - Cookie-based (preferred): The KUB proxy sets httpOnly cookies (id_token,
+      refresh_token) which are forwarded on every request via the Cookie header.
+    - Bearer fallback: Authorization: Bearer <token> header (legacy).
+    """
+
+    def __init__(
+        self,
+        access_token: str = "",
+        session_cookies: dict[str, str] | None = None,
+    ) -> None:
         self._session: aiohttp.ClientSession | None = None
         self.access_token = access_token
+        # Cookies returned by the KUB token proxy (id_token, refresh_token, …)
+        self.session_cookies: dict[str, str] = session_cookies or {}
+
+    def _build_cookie_header(self) -> str:
+        return "; ".join(f"{k}={v}" for k, v in self.session_cookies.items())
 
     async def __aenter__(self):
         headers: dict[str, str] = {}
-        if self.access_token:
+        if self.session_cookies:
+            # Cookie-based auth: send all proxy-issued cookies
+            headers["Cookie"] = self._build_cookie_header()
+        elif self.access_token:
+            # Fallback: Bearer token (works for /api/auth/v1/ but not /api/ami/v1/)
             headers["Authorization"] = f"Bearer {self.access_token}"
         self._session = aiohttp.ClientSession(
             headers=headers,
+            cookie_jar=aiohttp.DummyCookieJar(),
             timeout=aiohttp.ClientTimeout(total=10),
         )
         return self
@@ -115,6 +139,9 @@ class KubUtility:
         self._access_token: str = ""
         self._refresh_token: str = ""
         self._token_expires_at: datetime | None = None
+        # Cookies set by the KUB token proxy (id_token, refresh_token, …).
+        # These are forwarded on all API requests instead of a Bearer header.
+        self._session_cookies: dict[str, str] = {}
 
         self.usage = {"electricity": {}, "gas": {}, "water": {}, "wastewater": {}}
         self.monthly_total = {
@@ -129,8 +156,10 @@ class KubUtility:
 
     @property
     def is_session_active(self) -> bool:
-        """Returns True when the access token is still valid (with 60 s margin)."""
-        if not self._token_expires_at or not self._access_token:
+        """Returns True when the session cookies / access token are still valid (with 60 s margin)."""
+        if not self._token_expires_at:
+            return False
+        if not self._session_cookies and not self._access_token:
             return False
         return datetime.now() < self._token_expires_at - timedelta(seconds=60)
 
@@ -139,22 +168,29 @@ class KubUtility:
     # ------------------------------------------------------------------
 
     async def _retrieve_access_token(self):
-        """Authenticate via Azure AD B2C and store the access + refresh tokens.
+        """Authenticate via Azure AD B2C and store session cookies from KUB's token proxy.
 
-        The flow is the standard Azure AD B2C "SelfAsserted" headless flow:
+        The flow mirrors what the KUB Ember SPA does in a browser:
           1. GET /oauth2/v2.0/authorize  – obtain session cookies + CSRF token
           2. POST /SelfAsserted          – submit credentials
           3. GET /api/.../confirmed      – exchange for an auth *code*
-          4. POST /oauth2/v2.0/token     – exchange code for tokens (PKCE)
+          4. POST /api/auth/v1/oauth2/v2.0/token/customer  – KUB proxy exchanges code
+             for tokens and returns them via **Set-Cookie** (httpOnly).
+
+        The KUB proxy's cookies (id_token, refresh_token, …) are then forwarded
+        on every subsequent request to www.kub.org instead of a Bearer header.
         """
         verifier, challenge = _pkce_pair()
         state = secrets.token_urlsafe(16)
 
         timeout = aiohttp.ClientTimeout(total=30)
-        # Use a raw session with cookie jar so we can drive the B2C flow
+        # Use DummyCookieJar to disable aiohttp's automatic cookie handling.
+        # aiohttp silently drops cookies whose names contain colons (e.g.
+        # x-ms-cpim-sso:kubb2cprd.onmicrosoft.com_0), which are required by
+        # Azure AD B2C. We collect Set-Cookie headers manually and replay them.
         async with aiohttp.ClientSession(
             timeout=timeout,
-            cookie_jar=aiohttp.CookieJar(),
+            cookie_jar=aiohttp.DummyCookieJar(),
         ) as session:
             # ----------------------------------------------------------
             # Step 1 – GET authorize page to seed cookies & CSRF token
@@ -174,6 +210,15 @@ class KubUtility:
                         f"Authorize page returned HTTP {resp.status}"
                     )
                 html = await resp.text()
+                authorize_url = resp.url
+                # Manually collect all Set-Cookie headers into a dict.
+                # Store values exactly as the server sent them (no extra quoting).
+                session_cookies: dict[str, str] = {}
+                for sc in resp.headers.getall("Set-Cookie", []):
+                    first = sc.split(";")[0].strip()
+                    eq = first.find("=")
+                    if eq != -1:
+                        session_cookies[first[:eq].strip()] = first[eq + 1 :].strip()
 
             # Extract CSRF token and transaction ID from the page
             csrf_match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
@@ -185,6 +230,9 @@ class KubUtility:
             csrf_token = csrf_match.group(1)
             trans_id = trans_match.group(1)
 
+            def _build_cookie_header(cookies: dict[str, str]) -> str:
+                return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
             # ----------------------------------------------------------
             # Step 2 – POST credentials to SelfAsserted endpoint
             # ----------------------------------------------------------
@@ -192,7 +240,11 @@ class KubUtility:
             self_asserted_headers = {
                 "X-CSRF-TOKEN": csrf_token,
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": str(resp.url),
+                "Referer": str(authorize_url),
+                "Cookie": _build_cookie_header(session_cookies),
+                "Origin": _TENANT_HOST,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "en-US,en;q=0.9",
             }
             credential_data = {
                 "request_type": "RESPONSE",
@@ -205,7 +257,28 @@ class KubUtility:
                 data=credential_data,
                 headers=self_asserted_headers,
             ) as sa_resp:
-                sa_json = await sa_resp.json(content_type=None)
+                # Merge any new cookies from the SelfAsserted response
+                for sc in sa_resp.headers.getall("Set-Cookie", []):
+                    first = sc.split(";")[0].strip()
+                    eq = first.find("=")
+                    if eq != -1:
+                        session_cookies[first[:eq].strip()] = first[eq + 1 :].strip()
+                sa_text = await sa_resp.text()
+                if not sa_text or not sa_text.strip():
+                    raise KUBAuthenticationError(
+                        f"SelfAsserted endpoint returned an empty response "
+                        f"(HTTP {sa_resp.status}). The B2C policy or endpoint "
+                        f"may have changed."
+                    )
+                import json as _json
+
+                try:
+                    sa_json = _json.loads(sa_text)
+                except _json.JSONDecodeError as exc:
+                    raise KUBAuthenticationError(
+                        f"SelfAsserted endpoint returned non-JSON "
+                        f"(HTTP {sa_resp.status}): {sa_text[:200]}"
+                    ) from exc
                 if str(sa_json.get("status")) != "200":
                     error_msg = sa_json.get("message", "Authentication failed")
                     raise KUBAuthenticationError(error_msg)
@@ -224,6 +297,7 @@ class KubUtility:
                 _CONFIRMED_URL,
                 params=confirmed_params,
                 allow_redirects=False,
+                headers={"Cookie": _build_cookie_header(session_cookies)},
             ) as confirmed_resp:
                 location = confirmed_resp.headers.get("Location", "")
 
@@ -242,7 +316,8 @@ class KubUtility:
                 )
 
             # ----------------------------------------------------------
-            # Step 4 – Exchange auth code for tokens
+            # Step 4 – Exchange auth code via KUB's token proxy
+            # (not B2C directly — the proxy sets id_token as httpOnly cookie)
             # ----------------------------------------------------------
             token_data = {
                 "client_id": _CLIENT_ID,
@@ -250,32 +325,148 @@ class KubUtility:
                 "code": auth_code,
                 "redirect_uri": _REDIRECT_URI,
                 "code_verifier": verifier,
-                "scope": _SCOPE,
             }
-            async with session.post(_TOKEN_URL, data=token_data) as token_resp:
+            proxy_headers = {
+                "Origin": _KUB_BASE,
+                "Referer": f"{_KUB_BASE}/auth-callback",
+            }
+            async with session.post(
+                _KUB_TOKEN_PROXY,
+                data=token_data,
+                headers=proxy_headers,
+            ) as token_resp:
                 if token_resp.status != 200:
-                    body = await token_resp.text()
-                    raise KUBAuthenticationError(
-                        f"Token exchange failed (HTTP {token_resp.status}): {body}"
+                    # Fallback: try B2C token endpoint directly (older behavior)
+                    fallback_data = {
+                        "client_id": _CLIENT_ID,
+                        "grant_type": "authorization_code",
+                        "code": auth_code,
+                        "redirect_uri": _REDIRECT_URI,
+                        "code_verifier": verifier,
+                        "scope": _SCOPE,
+                    }
+                    async with session.post(_TOKEN_URL, data=fallback_data) as fb_resp:
+                        if fb_resp.status != 200:
+                            body = await fb_resp.text()
+                            raise KUBAuthenticationError(
+                                f"Token exchange failed (HTTP {fb_resp.status}): {body}"
+                            )
+                        token_json = await fb_resp.json()
+                    # Store as Bearer token (fallback mode — may not work for AMI)
+                    self._access_token = (
+                        token_json.get("id_token") or token_json["access_token"]
                     )
-                token_json = await token_resp.json()
+                    self._refresh_token = token_json.get("refresh_token", "")
+                    self._session_cookies = {}
+                    # Fall through to the expires_in block below
+                else:
+                    # Collect the httpOnly cookies set by KUB's proxy.
+                    # These cookies (id_token, refresh_token) are what the AMI
+                    # API requires for authentication.
+                    proxy_cookies: dict[str, str] = {}
+                    for sc in token_resp.headers.getall("Set-Cookie", []):
+                        first = sc.split(";")[0].strip()
+                        eq = first.find("=")
+                        if eq != -1:
+                            proxy_cookies[first[:eq].strip()] = first[eq + 1 :].strip()
 
-        self._access_token = token_json["access_token"]
-        self._refresh_token = token_json.get("refresh_token", "")
-        expires_in = int(token_json.get("expires_in", 3600))
+                    token_json = await token_resp.json()
+
+                    if proxy_cookies:
+                        # Primary path: use proxy-issued cookies for all API calls
+                        self._session_cookies = proxy_cookies
+                        self._access_token = (
+                            token_json.get("id_token", "") if token_json else ""
+                        )
+                        self._refresh_token = ""  # refresh handled by proxy via cookies
+                    else:
+                        # Proxy returned JSON but no cookies — store token as Bearer
+                        self._access_token = (token_json or {}).get("id_token") or (
+                            token_json or {}
+                        ).get("access_token", "")
+                        self._refresh_token = (token_json or {}).get(
+                            "refresh_token", ""
+                        )
+                        self._session_cookies = {}
+
+                    expires_in = (
+                        int((token_json or {}).get("expires_in", 3600))
+                        if token_json
+                        else 3600
+                    )
+                    self._token_expires_at = datetime.now() + timedelta(
+                        seconds=expires_in
+                    )
+                    self.session_start = datetime.now()
+
+                    # Propagate new session state to any active Http instance
+                    if self.http is not None:
+                        self.http.session_cookies = self._session_cookies
+                        self.http.access_token = self._access_token
+                    return
+
+        expires_in = int(token_json.get("expires_in", 3600)) if token_json else 3600
         self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
         self.session_start = datetime.now()
 
         # Propagate new token to any active Http instance
         if self.http is not None:
+            self.http.session_cookies = self._session_cookies
             self.http.access_token = self._access_token
 
     async def _refresh_access_token(self):
-        """Use the refresh token to obtain a new access token without re-authenticating."""
+        """Refresh the session using the KUB token proxy (cookie-based) or refresh token."""
+        if self._session_cookies:
+            # Cookie-based refresh: send existing cookies (which contain the
+            # httpOnly refresh_token). The proxy returns new cookies + JSON.
+            cookie_header = "; ".join(
+                f"{k}={v}" for k, v in self._session_cookies.items()
+            )
+            token_data = {
+                "client_id": _CLIENT_ID,
+                "grant_type": "refresh_token",
+            }
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as session:
+                async with session.post(
+                    _KUB_TOKEN_PROXY,
+                    data=token_data,
+                    headers={
+                        "Cookie": cookie_header,
+                        "Origin": _KUB_BASE,
+                        "Referer": f"{_KUB_BASE}/",
+                    },
+                ) as token_resp:
+                    if token_resp.status != 200:
+                        # Refresh failed — full re-authentication
+                        await self._retrieve_access_token()
+                        return
+                    # Collect new cookies from proxy response
+                    new_cookies: dict[str, str] = {}
+                    for sc in token_resp.headers.getall("Set-Cookie", []):
+                        first = sc.split(";")[0].strip()
+                        eq = first.find("=")
+                        if eq != -1:
+                            new_cookies[first[:eq].strip()] = first[eq + 1 :].strip()
+                    token_json = await token_resp.json()
+
+            if new_cookies:
+                self._session_cookies.update(new_cookies)
+            expires_in = (
+                int((token_json or {}).get("expires_in", 3600)) if token_json else 3600
+            )
+            self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+            if self.http is not None:
+                self.http.session_cookies = self._session_cookies
+            return
+
         if not self._refresh_token:
             await self._retrieve_access_token()
             return
 
+        # Legacy Bearer-token refresh via B2C directly
         token_data = {
             "client_id": _CLIENT_ID,
             "grant_type": "refresh_token",
@@ -292,7 +483,7 @@ class KubUtility:
                     return
                 token_json = await token_resp.json()
 
-        self._access_token = token_json["access_token"]
+        self._access_token = token_json.get("id_token") or token_json["access_token"]
         self._refresh_token = token_json.get("refresh_token", self._refresh_token)
         expires_in = int(token_json.get("expires_in", 3600))
         self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
@@ -301,9 +492,9 @@ class KubUtility:
             self.http.access_token = self._access_token
 
     async def _ensure_token(self):
-        """Ensure we have a valid access token, refreshing or re-authenticating as needed."""
+        """Ensure we have a valid session (cookies or token), refreshing as needed."""
         if not self.is_session_active:
-            if self._refresh_token:
+            if self._session_cookies or self._refresh_token:
                 await self._refresh_access_token()
             else:
                 await self._retrieve_access_token()
@@ -349,7 +540,9 @@ class KubUtility:
     async def retrieve_account_info(self):
         """Retrieves account info from KUB api"""
         await self._retrieve_access_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             await self._retrieve_account_info()
         self.http = None
 
@@ -439,7 +632,9 @@ class KubUtility:
         start_date = date.strftime("%Y-%m-%d")
 
         await self._ensure_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             if not self.person_id:
                 await self._retrieve_account_info()
 
@@ -453,7 +648,9 @@ class KubUtility:
         start_date = datetime.today().replace(day=1).strftime("%Y-%m-%d")
 
         await self._ensure_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             if not self.person_id:
                 await self._retrieve_account_info()
             for service in self.service_list:
@@ -468,7 +665,9 @@ class KubUtility:
     ):
         """Retrieve usage for a custom date range"""
         await self._ensure_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             if not self.person_id:
                 await self._retrieve_account_info()
             for service in self.service_list:
@@ -483,7 +682,9 @@ class KubUtility:
         start_date = datetime.today().replace(day=1).strftime("%Y-%m-%d")
 
         await self._ensure_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             if not self.person_id:
                 await self._retrieve_account_info()
             for service in self.service_list:
@@ -504,7 +705,9 @@ class KubUtility:
     async def get_available_services(self):
         """Returns available services for account"""
         await self._ensure_token()
-        async with Http(self._access_token) as self.http:
+        async with Http(
+            self._access_token, session_cookies=self._session_cookies
+        ) as self.http:
             if not self.person_id:
                 await self._retrieve_account_info()
         self.http = None
