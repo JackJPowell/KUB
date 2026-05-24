@@ -19,10 +19,12 @@ jobs:
                   python-version: "3.12"
 
             - name: Install build tools and dev dependencies
-              run: pip install hatch && pip install -e ".[dev]"
+              run: pip install hatch ".[dev]"
 
             - name: Run tests
               run: pytest --tb=short -v
+              env:
+                  PYTHONPATH: src
 
             - name: Build package
               run: hatch build
