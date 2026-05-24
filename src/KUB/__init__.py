@@ -1,4 +1,4 @@
-from kub.kub_utilities import (
+from .kub_utilities import (
     HTTPError,
     KUBAuthenticationError,
     KUBUtilityTypes,
