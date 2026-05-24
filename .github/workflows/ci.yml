@@ -28,3 +28,5 @@ jobs:
 
       - name: Run tests
         run: pytest --tb=short -v
+        env:
+          PYTHONPATH: src
