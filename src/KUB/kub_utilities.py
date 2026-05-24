@@ -107,7 +107,9 @@ class Http:
     async def fetch(self, url):
         """http get"""
         if self._session is None:
-            raise RuntimeError("Http session is not open. Use as an async context manager.")
+            raise RuntimeError(
+                "Http session is not open. Use as an async context manager."
+            )
         resp = await self._session.get(url)
         resp.raise_for_status()
         return resp
@@ -115,7 +117,9 @@ class Http:
     async def post(self, url, payload):
         """HTTP post (JSON body)"""
         if self._session is None:
-            raise RuntimeError("Http session is not open. Use as an async context manager.")
+            raise RuntimeError(
+                "Http session is not open. Use as an async context manager."
+            )
         resp = await self._session.post(url, json=payload)
         resp.raise_for_status()
         return resp
@@ -123,7 +127,9 @@ class Http:
     async def post_form(self, url, data: dict, headers: dict | None = None):
         """HTTP post (form-encoded body)"""
         if self._session is None:
-            raise RuntimeError("Http session is not open. Use as an async context manager.")
+            raise RuntimeError(
+                "Http session is not open. Use as an async context manager."
+            )
         resp = await self._session.post(url, data=data, headers=headers or {})
         resp.raise_for_status()
         return resp
