@@ -3,3 +3,4 @@ dist/*
 test.py
 __pycache__
 uv.lock
+.coverage
