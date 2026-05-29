@@ -577,17 +577,6 @@ class KubUtility:
         utility = utility_type.name.lower()
         account = self.account[utility]
 
-        # If we are processing wastewater so just copy water
-        # This does not account for separate meters for water and wastewater
-        # However, I do not know what the response looks like to process
-        # this case properly
-        if utility_type == KUBUtilityTypes.WASTEWATER:
-            water = KUBUtilityTypes.WATER.name.lower()
-            self.usage[utility] = copy.deepcopy(self.usage[water])
-            self.monthly_total[utility]["usage"] = self.monthly_total[water]["usage"]
-            self.monthly_total[utility]["cost"] = self.monthly_total[water]["cost"]
-            return self.usage
-
         url = (
             f"https://www.kub.org/api/ami/v1/usage-values"
             f"?endDate={end_date}"
